@@ -50,6 +50,15 @@ namespace Excel
 		private const string COLUMN = "Column";
 
 		private bool disposed;
+
+        /// <summary>
+        /// Is recovery mode enabled
+        /// </summary>
+        bool m_recoveryMode = false;
+        /// <summary>
+        /// Counts correctly taken cells, if there is no cells then restart.
+        /// </summary>
+        int m_takenCells = 0;        
 		
 		#endregion
 
@@ -158,7 +167,7 @@ namespace Excel
 				return;
 			}
 
-			XlsRootDirectory dir = new XlsRootDirectory(m_hdr);
+            XlsRootDirectory dir = new XlsRootDirectory(m_hdr);
 			XlsDirectoryEntry workbookEntry = dir.FindEntry(WORKBOOK) ?? dir.FindEntry(BOOK);
 
 			if (workbookEntry == null)
@@ -407,7 +416,10 @@ namespace Excel
 				m_cellOffset += rec.Size;
 
 				if ((rec is XlsBiffDbCell)) { break; };//break;
-				if (rec is XlsBiffEOF) { return false; };
+                if (rec is XlsBiffEOF) { 
+                    m_depth++;  
+                    return false; 
+                };
 
 				XlsBiffBlankCell cell = rec as XlsBiffBlankCell;
 
@@ -807,7 +819,7 @@ namespace Excel
                         break;
                     
                     default:
-                        if ((rec.ReadByte(m_globals.Sheets[m_globals.Sheets.Count-1].IsV8 ? 9 : 7) & 4) == 0)
+                        if (!m_globals.Sheets[m_globals.Sheets.Count - 1].IsV8 && (rec.ReadByte(7) & 4) == 0)
                             return value;
                         
                         format = rec.ReadUInt16(2);
@@ -897,6 +909,40 @@ namespace Excel
 			return value;
 
 	    }
+
+        private bool readRecoveryRow()
+        {
+            XlsBiffRecord rec;
+
+            int recoveryOffset = -1;
+
+            int currentColumn = 0;
+
+            m_cellsValues = new object[m_maxCol];
+            while ((rec = m_stream.Read()) != null)
+            {
+                XlsBiffBlankCell cell = rec as XlsBiffBlankCell;
+
+                if (cell is XlsBiffBlankCell)
+                {
+                    if (cell.RowIndex != m_depth)
+                    {
+                        if (cell.RowIndex > m_depth)
+                            recoveryOffset = m_stream.Position;
+                        continue;
+                    }
+
+                    pushCellValue(cell);
+                    currentColumn++;
+                    if (currentColumn == m_maxCol)
+                        break;
+                }
+            }
+            m_depth++;
+            if (recoveryOffset != -1)
+                m_stream.Seek(recoveryOffset, SeekOrigin.Begin);
+            return (m_depth < m_maxRow);
+        }
 
 	    public bool isV8()
 		{
@@ -1015,14 +1061,36 @@ namespace Excel
 			return true;
 		}
 
+      
+
 		public bool Read()
 		{
 			if (!m_isValid) return false;
 
-			if (m_IsFirstRead) initializeSheetRead();
+			if (m_IsFirstRead) initializeSheetRead();            
 
-			return moveToNextRecord();
-		}
+            if (m_recoveryMode)
+            {
+                return readRecoveryRow();
+            }
+            else if (moveToNextRecord())
+            {
+                m_takenCells++;
+                return true;
+            }
+            else if (m_takenCells == 0)
+            {
+                if (m_sheets.Count > 1)
+                {
+                    fail("Unable to load from recovery if sheets is more than 1");
+                    return false;
+                }
+                m_recoveryMode = true;
+                m_stream.Seek(0, SeekOrigin.Begin);
+                return readRecoveryRow();
+            }
+            return false;
+		}        
 
 		public int FieldCount
 		{
